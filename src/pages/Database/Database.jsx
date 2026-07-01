@@ -1,0 +1,678 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { StorageService } from '../../services/storage';
+import { ExportService } from '../../services/export';
+import { PAYMENT_METHODS } from '../../constants/paymentMethods';
+import { Card, CardContent } from '../../components/ui/Card';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/Table';
+import Button from '../../components/ui/Button';
+import Input from '../../components/ui/Input';
+import Dropdown from '../../components/ui/Dropdown';
+import SearchInput from '../../components/ui/SearchInput';
+import Modal from '../../components/ui/Modal';
+import ConfirmDialog from '../../components/ui/ConfirmDialog';
+import { Edit2, Trash2, ChevronLeft, ChevronRight, ArrowUpDown, ChevronDown, ChevronUp, FileSpreadsheet, FileText, FileDown, Inbox } from 'lucide-react';
+import { cn } from '../../utils/cn';
+import { useSearch } from '../../hooks/useSearch';
+import { useToast } from '../../components/ui/Toast';
+import EmptyState from '../../components/ui/EmptyState';
+import { debounce } from '../../utils/helpers';
+
+export default function Database() {
+  const { addToast } = useToast();
+  const [events, setEvents] = useState([]);
+  const [selectedEventId, setSelectedEventId] = useState('');
+  const [entries, setEntries] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [receiptPrefix, setReceiptPrefix] = useState('MR-');
+  const [currency, setCurrency] = useState('₹');
+
+  // Search & Filter
+  const [searchQuery, setSearchQuery] = useState('');
+  const [displayQuery, setDisplayQuery] = useState('');
+  const [paymentFilter, setPaymentFilter] = useState('All');
+  
+  // Sort
+  const [sortConfig, setSortConfig] = useState({ key: 'createdAt', direction: 'desc' });
+  
+  // Pagination
+  const [currentPage, setCurrentPage] = useState(1);
+  const ITEMS_PER_PAGE = 15;
+
+  // Modals
+  const [editingEntry, setEditingEntry] = useState(null);
+  const [editForm, setEditForm] = useState(null);
+  const [isEditSubmitting, setIsEditSubmitting] = useState(false);
+  const [entryToDelete, setEntryToDelete] = useState(null);
+
+  // Load event list
+  const loadEvents = useCallback(async () => {
+    try {
+      const settings = await StorageService.getSettings();
+      if (settings?.receiptPrefix) setReceiptPrefix(settings.receiptPrefix);
+      if (settings?.currency) setCurrency(settings.currency);
+
+      const allEvents = await StorageService.getEvents();
+      setEvents(allEvents);
+      if (allEvents.length > 0) {
+        setSelectedEventId(allEvents[0].id); // Auto-select newest
+      } else {
+        setIsLoading(false);
+      }
+    } catch (error) {
+      console.error(error);
+      setIsLoading(false);
+      addToast({
+        type: 'error',
+        title: 'Error Loading Events',
+        message: 'Could not fetch list of events.'
+      });
+    }
+  }, [addToast]);
+
+  // Load entries for selected event
+  const loadEntries = useCallback(async (eventId) => {
+    setIsLoading(true);
+    try {
+      const evEntries = await StorageService.getEntries(eventId);
+      setEntries(evEntries);
+    } catch (error) {
+      console.error(error);
+      addToast({
+        type: 'error',
+        title: 'Error Loading Entries',
+        message: 'Failed to retrieve ledger guest lists.'
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [addToast]);
+
+  useEffect(() => {
+    loadEvents();
+  }, [loadEvents]);
+
+  useEffect(() => {
+    if (selectedEventId) {
+      loadEntries(selectedEventId);
+      setCurrentPage(1); // Reset page on event change
+    } else {
+      setEntries([]);
+    }
+  }, [selectedEventId, loadEntries]);
+
+  // Debounced search text state setter
+  const debouncedSetSearchQuery = useMemo(
+    () => debounce((val) => {
+      setSearchQuery(val);
+      setCurrentPage(1);
+    }, 250),
+    []
+  );
+
+  const handleSearchChange = (e) => {
+    const val = e.target.value;
+    setDisplayQuery(val);
+    debouncedSetSearchQuery(val);
+  };
+
+  // Custom Hook: Standardized item searching logic
+  const searchedEntries = useSearch(entries, searchQuery, ['name', 'receiptNumber'], receiptPrefix);
+
+  // --- PROCESSING CHAIN: Filter -> Sort -> Paginate ---
+  const filteredAndSortedEntries = useMemo(() => {
+    let result = [...searchedEntries];
+    
+    // 1. Payment Method Filter
+    if (paymentFilter !== 'All') {
+      result = result.filter(e => e.paymentMethod === paymentFilter);
+    }
+    
+    // 2. Sort
+    result.sort((a, b) => {
+      let aVal = a[sortConfig.key];
+      let bVal = b[sortConfig.key];
+      
+      if (sortConfig.key === 'amount' || sortConfig.key === 'receiptNumber') {
+        aVal = Number(aVal);
+        bVal = Number(bVal);
+      }
+      
+      if (typeof aVal === 'string' && typeof bVal === 'string') {
+        return sortConfig.direction === 'asc' 
+          ? aVal.localeCompare(bVal) 
+          : bVal.localeCompare(aVal);
+      }
+      
+      if (aVal < bVal) return sortConfig.direction === 'asc' ? -1 : 1;
+      if (aVal > bVal) return sortConfig.direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+    
+    return result;
+  }, [searchedEntries, paymentFilter, sortConfig]);
+
+  const filteredTotals = useMemo(() => {
+    const totalAmount = filteredAndSortedEntries.reduce((sum, e) => sum + e.amount, 0);
+    return {
+      count: filteredAndSortedEntries.length,
+      amount: totalAmount
+    };
+  }, [filteredAndSortedEntries]);
+
+  const totalPages = Math.ceil(filteredAndSortedEntries.length / ITEMS_PER_PAGE);
+
+  // Keyboard navigation for pagination (Left/Right Arrows)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+        return;
+      }
+      if (e.key === 'ArrowLeft') {
+        setCurrentPage(p => Math.max(1, p - 1));
+      } else if (e.key === 'ArrowRight') {
+        setCurrentPage(p => Math.min(totalPages, p + 1));
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [totalPages]);
+
+  const pageNumbers = useMemo(() => {
+    const pages = [];
+    const maxVisiblePages = 5;
+    let startPage = Math.max(1, currentPage - Math.floor(maxVisiblePages / 2));
+    let endPage = Math.min(totalPages, startPage + maxVisiblePages - 1);
+    
+    if (endPage - startPage + 1 < maxVisiblePages) {
+      startPage = Math.max(1, endPage - maxVisiblePages + 1);
+    }
+    
+    for (let i = startPage; i <= endPage; i++) {
+      pages.push(i);
+    }
+    return pages;
+  }, [currentPage, totalPages]);
+
+  const paginatedEntries = useMemo(() => {
+    const start = (currentPage - 1) * ITEMS_PER_PAGE;
+    return filteredAndSortedEntries.slice(start, start + ITEMS_PER_PAGE);
+  }, [filteredAndSortedEntries, currentPage]);
+
+  const handleSort = (key) => {
+    setSortConfig(prev => ({
+      key,
+      direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc'
+    }));
+  };
+
+  // --- ACTIONS ---
+  const handleEditSave = async (e) => {
+    e.preventDefault();
+    if (!editForm.name.trim() || !editForm.amount || Number(editForm.amount) <= 0) {
+      addToast({
+        type: 'error',
+        title: 'Validation Error',
+        message: 'Name and amount are required.'
+      });
+      return;
+    }
+    setIsEditSubmitting(true);
+    try {
+      await StorageService.updateEntry(editingEntry.id, {
+        name: editForm.name.trim(),
+        amount: Number(editForm.amount),
+        paymentMethod: editForm.paymentMethod
+      });
+      addToast({
+        type: 'success',
+        title: 'Entry Updated',
+        message: 'Guest record updated successfully.'
+      });
+      await loadEntries(selectedEventId);
+      setEditingEntry(null);
+    } catch (err) {
+      addToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: err.message || 'Could not update guest entry.'
+      });
+    } finally {
+      setIsEditSubmitting(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    try {
+      await StorageService.deleteEntry(entryToDelete);
+      addToast({
+        type: 'success',
+        title: 'Entry Deleted',
+        message: 'Guest contribution removed.'
+      });
+      await loadEntries(selectedEventId);
+    } catch(err) {
+      addToast({
+        type: 'error',
+        title: 'Deletion Failed',
+        message: err.message || 'Could not remove guest entry.'
+      });
+    } finally {
+      setEntryToDelete(null);
+    }
+  };
+
+  // --- EXPORT HELPERS ---
+  const getExportContext = () => {
+    const event = events.find(e => e.id === selectedEventId);
+    return { eventName: event?.eventName, prefix: receiptPrefix, currency: '₹' };
+  };
+
+  const handleExportCSV = () => {
+    const { eventName, prefix, currency } = getExportContext();
+    ExportService.toCSV(filteredAndSortedEntries, eventName, prefix, currency);
+    addToast({
+      type: 'success',
+      title: 'CSV Exported',
+      message: `Exported ${filteredAndSortedEntries.length} items to CSV.`
+    });
+  };
+
+  const handleExportExcel = () => {
+    const { eventName, prefix, currency } = getExportContext();
+    ExportService.toExcel(filteredAndSortedEntries, eventName, prefix, currency);
+    addToast({
+      type: 'success',
+      title: 'Excel Exported',
+      message: `Exported ${filteredAndSortedEntries.length} items to Excel.`
+    });
+  };
+
+  const handleExportPDF = () => {
+    const { eventName, prefix, currency } = getExportContext();
+    ExportService.toPDF(filteredAndSortedEntries, eventName, prefix, currency);
+    addToast({
+      type: 'success',
+      title: 'PDF Exported',
+      message: `Exported ${filteredAndSortedEntries.length} items to PDF.`
+    });
+  };
+
+  const SortableHead = ({ label, sortKey, className }) => (
+    <TableHead 
+      className={cn("cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors group px-6", className)}
+      onClick={() => handleSort(sortKey)}
+    >
+      <div className="flex items-center space-x-1">
+        <span className="font-semibold text-gray-700 dark:text-gray-300">{label}</span>
+        <span className="text-gray-400 group-hover:text-gray-600 dark:group-hover:text-gray-300">
+          {sortConfig.key === sortKey ? (
+            sortConfig.direction === 'asc' ? <ChevronUp size={14} /> : <ChevronDown size={14} />
+          ) : (
+            <ArrowUpDown size={14} className="opacity-0 group-hover:opacity-100" />
+          )}
+        </span>
+      </div>
+    </TableHead>
+  );
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-300 h-full flex flex-col">
+      <div className="flex flex-col md:flex-row justify-between md:items-end gap-4">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Database Viewer</h1>
+          <p
+            style={{ fontFamily: '"Lemon",Aerial' }}
+            className="text-gray-500 dark:text-gray-400 mt-1"
+          >
+            Deep dive, filter, and export all recorded transactions.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleExportCSV}
+            disabled={filteredAndSortedEntries.length === 0}
+          >
+            <FileDown size={16} className="mr-1.5 text-emerald-600" /> CSV
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleExportExcel}
+            disabled={filteredAndSortedEntries.length === 0}
+          >
+            <FileSpreadsheet size={16} className="mr-1.5 text-green-600" />{" "}
+            Excel
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleExportPDF}
+            disabled={filteredAndSortedEntries.length === 0}
+          >
+            <FileText size={16} className="mr-1.5 text-red-500" /> PDF
+          </Button>
+        </div>
+      </div>
+
+      <Card className="flex-1 flex flex-col border-0 shadow-sm ring-1 ring-gray-200 dark:ring-gray-800 overflow-hidden">
+        {/* Top Controls Bar */}
+        <div className="p-4 md:p-5 border-b border-gray-100 dark:border-gray-800 bg-gray-50/30 dark:bg-gray-800/20 flex flex-col xl:flex-row gap-4 justify-between xl:items-center">
+          <div className="flex flex-col md:flex-row items-start md:items-center gap-4 w-full xl:w-auto">
+            <div className="w-full md:w-64">
+              <Dropdown
+                value={selectedEventId}
+                onChange={(e) => setSelectedEventId(e.target.value)}
+                options={events.map((e) => ({
+                  value: e.id,
+                  label: e.eventName,
+                }))}
+                className="bg-white shadow-sm"
+                disabled={isLoading || events.length === 0}
+              />
+            </div>
+
+            <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700">
+              Showing {filteredTotals.count} entries • Total: ₹
+              {filteredTotals.amount.toLocaleString("en-IN")}
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-4 w-full xl:w-auto">
+            <SearchInput
+              placeholder="Search name, receipt..."
+              value={displayQuery}
+              onChange={handleSearchChange}
+              className="w-full sm:w-64 bg-white shadow-sm"
+            />
+            <Dropdown
+              value={paymentFilter}
+              onChange={(e) => {
+                setPaymentFilter(e.target.value);
+                setCurrentPage(1);
+              }}
+              options={[
+                { value: "All", label: "All Methods" },
+                ...PAYMENT_METHODS,
+              ]}
+              className="w-full sm:w-48 bg-white shadow-sm"
+            />
+          </div>
+        </div>
+
+        {/* Data Grid */}
+        <CardContent className="p-0 flex-1 overflow-x-auto relative min-h-[500px]">
+          {isLoading ? (
+            <div className="flex justify-center items-center h-64 text-gray-400">
+              Loading Grid...
+            </div>
+          ) : paginatedEntries.length === 0 ? (
+            <EmptyState
+              icon={Inbox}
+              title="No records found"
+              description={
+                searchQuery || paymentFilter !== "All"
+                  ? "Try clearing filters to view all entries."
+                  : "There are no guest records recorded for this event yet."
+              }
+              actionLabel={
+                searchQuery || paymentFilter !== "All" ? "Clear Filters" : null
+              }
+              onAction={
+                searchQuery || paymentFilter !== "All"
+                  ? () => {
+                      setSearchQuery("");
+                      setDisplayQuery("");
+                      setPaymentFilter("All");
+                    }
+                  : null
+              }
+            />
+          ) : (
+            <Table className="w-full border-collapse">
+              <TableHeader className="bg-gray-50/80 dark:bg-gray-800/80 backdrop-blur-sm sticky top-0 z-10 shadow-sm border-b">
+                <TableRow>
+                  <SortableHead label="Receipt" sortKey="receiptNumber" />
+                  <SortableHead label="Guest Name" sortKey="name" />
+                  <SortableHead
+                    label={`Amount (${currency})`}
+                    sortKey="amount"
+                    className="text-right flex-row-reverse"
+                  />
+                  <SortableHead label="Method" sortKey="paymentMethod" />
+                  <SortableHead label="Date Recorded" sortKey="createdAt" />
+                  <TableHead className="text-right pr-6">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {paginatedEntries.map((entry, index) => (
+                  <TableRow
+                    key={entry.id}
+                    className={cn(
+                      "hover:bg-blue-50/50 dark:hover:bg-blue-900/10",
+                      index % 2 === 0
+                        ? "bg-white dark:bg-[var(--card)]"
+                        : "bg-gray-50/30 dark:bg-gray-800/10",
+                    )}
+                  >
+                    <TableCell className="px-6 font-mono text-xs text-gray-500">
+                      {receiptPrefix}
+                      {entry.receiptNumber}
+                    </TableCell>
+                    <TableCell className="px-6 font-semibold text-gray-900 dark:text-white whitespace-nowrap">
+                      {entry.name}
+                    </TableCell>
+                    <TableCell className="px-6 text-right font-bold text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+                      {entry.amount.toLocaleString("en-IN")}
+                    </TableCell>
+                    <TableCell className="px-6">
+                      <span className="text-xs bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400 px-2 py-1 rounded-md">
+                        {entry.paymentMethod}
+                      </span>
+                    </TableCell>
+                    <TableCell className="px-6 text-sm text-gray-500 whitespace-nowrap">
+                      {new Date(entry.createdAt).toLocaleDateString("en-IN", {
+                        day: "numeric",
+                        month: "short",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </TableCell>
+                    <TableCell className="px-6 text-right">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          onClick={() => {
+                            setEditingEntry(entry);
+                            setEditForm({
+                              name: entry.name,
+                              amount: entry.amount,
+                              paymentMethod: entry.paymentMethod,
+                            });
+                          }}
+                          className="p-1.5 text-gray-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-md transition-colors"
+                          aria-label={`Edit guest entry for ${entry.name}`}
+                        >
+                          <Edit2 size={16} />
+                        </button>
+                        <button
+                          onClick={() => setEntryToDelete(entry.id)}
+                          className="p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-md transition-colors"
+                          aria-label={`Delete guest entry for ${entry.name}`}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+
+        {/* Pagination Footer */}
+        <div className="border-t border-gray-200 dark:border-gray-800 p-4 flex flex-col sm:flex-row items-center justify-between text-sm text-gray-500 bg-gray-50/50 dark:bg-gray-800/30 gap-4">
+          <div>
+            Showing{" "}
+            <span className="font-semibold text-gray-900 dark:text-white">
+              {(currentPage - 1) * ITEMS_PER_PAGE +
+                (paginatedEntries.length > 0 ? 1 : 0)}
+            </span>{" "}
+            to{" "}
+            <span className="font-semibold text-gray-900 dark:text-white">
+              {(currentPage - 1) * ITEMS_PER_PAGE + paginatedEntries.length}
+            </span>{" "}
+            of{" "}
+            <span className="font-semibold text-gray-900 dark:text-white">
+              {filteredAndSortedEntries.length}
+            </span>{" "}
+            results
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage === 1}
+              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+              aria-label="Previous Page"
+            >
+              <ChevronLeft size={16} />
+            </Button>
+
+            <div className="flex gap-1">
+              {pageNumbers.map((page) => (
+                <button
+                  key={page}
+                  onClick={() => setCurrentPage(page)}
+                  className={cn(
+                    "h-8 w-8 rounded-lg text-xs font-semibold transition-colors outline-none",
+                    currentPage === page
+                      ? "bg-indigo-600 text-white font-bold"
+                      : "bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700",
+                  )}
+                  aria-label={`Go to Page ${page}`}
+                >
+                  {page}
+                </button>
+              ))}
+            </div>
+
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={currentPage === totalPages || totalPages === 0}
+              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+              aria-label="Next Page"
+            >
+              <ChevronRight size={16} />
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      {/* EDIT MODAL */}
+      <Modal
+        isOpen={!!editingEntry}
+        onClose={() => setEditingEntry(null)}
+        title="Edit Entry"
+      >
+        {editForm && (
+          <form onSubmit={handleEditSave} className="space-y-4">
+            <div>
+              <label
+                htmlFor="editDbGuestNameInput"
+                className="block text-sm font-semibold mb-1.5 text-gray-700 dark:text-gray-300"
+              >
+                Name
+              </label>
+              <Input
+                id="editDbGuestNameInput"
+                value={editForm.name}
+                onChange={(e) =>
+                  setEditForm((p) => ({ ...p, name: e.target.value }))
+                }
+                autoFocus
+                aria-required="true"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="editDbAmountInput"
+                className="block text-sm font-semibold mb-1.5 text-gray-700 dark:text-gray-300"
+              >
+                Amount (₹)
+              </label>
+              <Input
+                id="editDbAmountInput"
+                type="number"
+                value={editForm.amount}
+                onChange={(e) =>
+                  setEditForm((p) => ({ ...p, amount: e.target.value }))
+                }
+                aria-required="true"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold mb-2 text-gray-700 dark:text-gray-300">
+                Payment Method
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {PAYMENT_METHODS.map((method) => (
+                  <button
+                    key={method}
+                    type="button"
+                    onClick={() =>
+                      setEditForm((prev) => ({
+                        ...prev,
+                        paymentMethod: method,
+                      }))
+                    }
+                    className={cn(
+                      "px-3 py-1 text-sm font-medium transition-all border rounded-lg",
+                      editForm.paymentMethod === method
+                        ? "bg-indigo-50 border-indigo-300 text-indigo-700 dark:bg-indigo-900/40 dark:border-indigo-500/50 dark:text-indigo-300"
+                        : "bg-transparent border-gray-200 text-gray-600 dark:border-gray-700 dark:text-gray-400",
+                    )}
+                  >
+                    {method}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex justify-end pt-4 space-x-3">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setEditingEntry(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                isLoading={isEditSubmitting}
+              >
+                Save Updates
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={!!entryToDelete}
+        onClose={() => setEntryToDelete(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete Entry"
+        message="Are you sure you want to completely remove this entry? The total collection amount for this event will be automatically adjusted."
+        confirmText="Delete Record"
+        cancelText="Cancel"
+        isDanger={true}
+      />
+    </div>
+  );
+}
