@@ -1,5 +1,7 @@
-import React, { lazy, Suspense } from "react";
-import { HashRouter, Routes, Route } from "react-router-dom";
+import React, { lazy, Suspense, useEffect, useState } from "react";
+import { HashRouter, Routes, Route, Navigate } from "react-router-dom";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "./firebase";
 import { SettingsProvider } from "./context/SettingsContext";
 import { EventProvider } from "./context/EventContext";
 import { ToastProvider } from "./components/ui/Toast";
@@ -13,6 +15,7 @@ const EventView = lazy(() => import("./pages/EventView/EventView"));
 const Database = lazy(() => import("./pages/Database/Database"));
 const EventHistory = lazy(() => import("./pages/EventHistory/EventHistory"));
 const Settings = lazy(() => import("./pages/Settings/Settings"));
+const Login = lazy(() => import("./pages/Auth/Login"));
 
 const PageLoader = () => (
   <div className="flex flex-col items-center justify-center min-h-[50vh] space-y-4">
@@ -24,6 +27,29 @@ const PageLoader = () => (
 );
 
 function App() {
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
+      setUser(nextUser);
+      setAuthReady(true);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  if (!authReady) {
+    return <PageLoader />;
+  }
+
+  const ProtectedRoute = ({ children }) => {
+    if (!user) {
+      return <Navigate to="/login" replace />;
+    }
+    return children;
+  };
+
   return (
     <SettingsProvider>
       <ToastProvider>
@@ -32,7 +58,15 @@ function App() {
             <HashRouter>
               <Suspense fallback={<PageLoader />}>
                 <Routes>
-                  <Route path="/" element={<MainLayout />}>
+                  <Route path="/login" element={<Login />} />
+                  <Route
+                    path="/"
+                    element={
+                      <ProtectedRoute>
+                        <MainLayout />
+                      </ProtectedRoute>
+                    }
+                  >
                     <Route index element={<Dashboard />} />
                     <Route
                       path={ROUTES.CREATE_EVENT}
@@ -50,6 +84,10 @@ function App() {
                     <Route path={ROUTES.HISTORY} element={<EventHistory />} />
                     <Route path={ROUTES.SETTINGS} element={<Settings />} />
                   </Route>
+                  <Route
+                    path="*"
+                    element={<Navigate to={user ? "/" : "/login"} replace />}
+                  />
                 </Routes>
               </Suspense>
             </HashRouter>

@@ -11,7 +11,7 @@ import {
   where,
   writeBatch,
 } from "firebase/firestore";
-import { db, isFirebaseConfigured } from "../firebase";
+import { auth, db, isFirebaseConfigured } from "../firebase";
 
 /**
  * Storage Service - Firestore Database Abstraction
@@ -54,6 +54,16 @@ const normalizeEntry = (docSnap) => ({
 const getEventsCollection = () => collection(db, "events");
 const getEntriesCollection = () => collection(db, "entries");
 const getSettingsDoc = () => doc(db, "settings", SETTINGS_DOC_ID);
+
+const getCurrentOwner = () => {
+  const currentUser = auth.currentUser;
+  if (!currentUser) return null;
+
+  return {
+    ownerId: currentUser.uid,
+    ownerEmail: currentUser.email || "",
+  };
+};
 
 const readLocalDB = () => {
   try {
@@ -117,15 +127,26 @@ const generateUniqueShareId = async () => {
 };
 
 const getSortedEvents = async () => {
+  const owner = getCurrentOwner();
+
   if (!isFirebaseConfigured) {
-    return readLocalDB()
-      .events.slice()
+    const userEvents = owner
+      ? readLocalDB().events.filter((event) => event.ownerId === owner.ownerId)
+      : [];
+    return userEvents
+      .slice()
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   }
 
-  const q = query(getEventsCollection(), orderBy("createdAt", "desc"));
+  if (!owner) {
+    return [];
+  }
+
+  const q = query(getEventsCollection(), where("ownerId", "==", owner.ownerId));
   const snapshot = await getDocs(q);
-  return snapshot.docs.map(normalizeEvent);
+  return snapshot.docs
+    .map(normalizeEvent)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 };
 
 const subscribeToLocalDB = (callback) => {
@@ -138,21 +159,35 @@ const subscribeToLocalDB = (callback) => {
 };
 
 const subscribeToSortedEvents = (callback, onError = null) => {
+  const owner = getCurrentOwner();
+
   if (!isFirebaseConfigured) {
     return subscribeToLocalDB((dbState) => {
+      const userEvents = owner
+        ? dbState.events.filter((event) => event.ownerId === owner.ownerId)
+        : [];
       callback(
-        dbState.events
-          .slice()
-          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+        userEvents.sort(
+          (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+        ),
       );
     });
   }
 
-  const q = query(getEventsCollection(), orderBy("createdAt", "desc"));
+  if (!owner) {
+    callback([]);
+    return () => {};
+  }
+
+  const q = query(getEventsCollection(), where("ownerId", "==", owner.ownerId));
   return onSnapshot(
     q,
     (snapshot) => {
-      callback(snapshot.docs.map(normalizeEvent));
+      callback(
+        snapshot.docs
+          .map(normalizeEvent)
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+      );
     },
     (error) => {
       console.error("Failed to subscribe to events from Firestore:", error);
@@ -376,6 +411,11 @@ export const StorageService = {
   },
 
   createEvent: async (data) => {
+    const owner = getCurrentOwner();
+    if (!owner) {
+      throw new Error("Authentication required");
+    }
+
     const shareId = await generateUniqueShareId();
 
     if (!isFirebaseConfigured) {
@@ -383,6 +423,8 @@ export const StorageService = {
       const newEvent = {
         id: generateId("evt"),
         shareId,
+        ownerId: owner.ownerId,
+        ownerEmail: owner.ownerEmail,
         eventName: data.eventName,
         brideName: data.brideName || "",
         groomName: data.groomName || "",
@@ -405,6 +447,8 @@ export const StorageService = {
     const newEvent = {
       id: generateId("evt"),
       shareId,
+      ownerId: owner.ownerId,
+      ownerEmail: owner.ownerEmail,
       eventName: data.eventName,
       brideName: data.brideName || "",
       groomName: data.groomName || "",
@@ -440,9 +484,19 @@ export const StorageService = {
       return nextEvent;
     }
 
+    const owner = getCurrentOwner();
+    if (!owner) {
+      throw new Error("Authentication required");
+    }
+
     const ref = doc(db, "events", id);
     const snapshot = await getDoc(ref);
     if (!snapshot.exists()) {
+      throw new Error("Event not found");
+    }
+
+    const existingEvent = snapshot.data();
+    if (existingEvent.ownerId && existingEvent.ownerId !== owner.ownerId) {
       throw new Error("Event not found");
     }
 
@@ -469,9 +523,19 @@ export const StorageService = {
       return true;
     }
 
+    const owner = getCurrentOwner();
+    if (!owner) {
+      throw new Error("Authentication required");
+    }
+
     const eventRef = doc(db, "events", id);
     const eventSnapshot = await getDoc(eventRef);
     if (!eventSnapshot.exists()) {
+      throw new Error("Event not found");
+    }
+
+    const existingEvent = eventSnapshot.data();
+    if (existingEvent.ownerId && existingEvent.ownerId !== owner.ownerId) {
       throw new Error("Event not found");
     }
 
