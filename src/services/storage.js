@@ -4,13 +4,11 @@ import {
   getDoc,
   getDocs,
   onSnapshot,
-  orderBy,
   query,
   runTransaction,
   setDoc,
   where,
   writeBatch,
-  or,
 } from "firebase/firestore";
 import { auth, db, isFirebaseConfigured } from "../firebase";
 
@@ -135,6 +133,9 @@ const getSortedEvents = async () => {
       ? readLocalDB().events.filter(
           (event) =>
             event.ownerId === owner.ownerId ||
+            (Array.isArray(event.sharedUsers) &&
+              (event.sharedUsers.includes(owner.ownerId) ||
+                event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
             (Array.isArray(event.sharedEmails) &&
               event.sharedEmails.includes(owner.ownerEmail.toLowerCase())),
         )
@@ -148,15 +149,26 @@ const getSortedEvents = async () => {
     return [];
   }
 
-  const q = query(
-    getEventsCollection(),
-    or(
-      where("ownerId", "==", owner.ownerId),
-      where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()),
-    ),
-  );
-  const snapshot = await getDocs(q);
-  return snapshot.docs
+  // Run two parallel queries because Firestore `or` with `array-contains` on
+  // different fields requires separate queries, then deduplicate client-side.
+  const [snapByOwner, snapByUsers, snapByEmails] = await Promise.all([
+    getDocs(query(getEventsCollection(), where("ownerId", "==", owner.ownerId))),
+    getDocs(query(getEventsCollection(), where("sharedUsers", "array-contains", owner.ownerId))),
+    getDocs(query(getEventsCollection(), where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()))),
+  ]);
+
+  const seen = new Set();
+  const allDocs = [
+    ...snapByOwner.docs,
+    ...snapByUsers.docs,
+    ...snapByEmails.docs,
+  ].filter((d) => {
+    if (seen.has(d.id)) return false;
+    seen.add(d.id);
+    return true;
+  });
+
+  return allDocs
     .map(normalizeEvent)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 };
@@ -179,6 +191,9 @@ const subscribeToSortedEvents = (callback, onError = null) => {
         ? dbState.events.filter(
             (event) =>
               event.ownerId === owner.ownerId ||
+              (Array.isArray(event.sharedUsers) &&
+                (event.sharedUsers.includes(owner.ownerId) ||
+                  event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
               (Array.isArray(event.sharedEmails) &&
                 event.sharedEmails.includes(owner.ownerEmail.toLowerCase())),
           )
@@ -196,31 +211,64 @@ const subscribeToSortedEvents = (callback, onError = null) => {
     return () => {};
   }
 
-  const q = query(
-    getEventsCollection(),
-    or(
-      where("ownerId", "==", owner.ownerId),
-      where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()),
-    ),
-  );
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      callback(
-        snapshot.docs
-          .map(normalizeEvent)
-          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
-      );
-    },
-    (error) => {
-      console.error("Failed to subscribe to events from Firestore:", error);
-      if (onError) {
-        onError(error);
-      } else {
-        callback([]);
+  // Firestore does not support `or` with `array-contains` on different fields
+  // in a single query. Run three parallel snapshots and merge client-side.
+  const mergedMap = new Map(); // id -> event
+  let unsub1Err = false;
+  let unsub2Err = false;
+  let unsub3Err = false;
+
+  const emit = () => {
+    callback(
+      Array.from(mergedMap.values()).sort(
+        (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+      ),
+    );
+  };
+
+  const handleError = (error) => {
+    console.error("Failed to subscribe to events from Firestore:", error);
+    if (onError) onError(error);
+    else callback([]);
+  };
+
+
+
+  const q1 = query(getEventsCollection(), where("ownerId", "==", owner.ownerId));
+  const q2 = query(getEventsCollection(), where("sharedUsers", "array-contains", owner.ownerId));
+  const q3 = query(getEventsCollection(), where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()));
+
+  // Track which doc IDs come from which query so we can remove properly
+  const idsFromQ1 = new Set();
+  const idsFromQ2 = new Set();
+  const idsFromQ3 = new Set();
+
+  const makeHandler = (idsSet) => (snapshot) => {
+    const newIds = new Set();
+    snapshot.docs.forEach((d) => {
+      mergedMap.set(d.id, normalizeEvent(d));
+      newIds.add(d.id);
+    });
+    // Remove docs that disappeared from this query and aren't in another set
+    idsSet.forEach((id) => {
+      if (!newIds.has(id) && !idsFromQ1.has(id) && !idsFromQ2.has(id) && !idsFromQ3.has(id)) {
+        mergedMap.delete(id);
       }
-    },
-  );
+    });
+    idsSet.clear();
+    newIds.forEach((id) => idsSet.add(id));
+    emit();
+  };
+
+  const unsub1 = onSnapshot(q1, makeHandler(idsFromQ1), (err) => { unsub1Err = true; handleError(err); });
+  const unsub2 = onSnapshot(q2, makeHandler(idsFromQ2), (err) => { unsub2Err = true; handleError(err); });
+  const unsub3 = onSnapshot(q3, makeHandler(idsFromQ3), (err) => { unsub3Err = true; handleError(err); });
+
+  return () => {
+    if (!unsub1Err) unsub1();
+    if (!unsub2Err) unsub2();
+    if (!unsub3Err) unsub3();
+  };
 };
 
 const getEntriesForEventIds = async (eventIds) => {
@@ -348,26 +396,40 @@ const subscribeToSortedEntries = (eventId = null, callback, onError = null) => {
       });
     };
 
-    const qEvents = query(
-      getEventsCollection(),
-      or(
-        where("ownerId", "==", owner.ownerId),
-        where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()),
-      ),
-    );
+    // Merge 3 parallel queries; shared events may match ownerId, sharedUsers UID, or sharedEmails
+    const buildMergedEventIds = async () => {
+      const [s1, s2, s3] = await Promise.all([
+        getDocs(query(getEventsCollection(), where("ownerId", "==", owner.ownerId))),
+        getDocs(query(getEventsCollection(), where("sharedUsers", "array-contains", owner.ownerId))),
+        getDocs(query(getEventsCollection(), where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()))),
+      ]);
+      const seen = new Set();
+      [...s1.docs, ...s2.docs, ...s3.docs].forEach((d) => seen.add(d.id));
+      return Array.from(seen);
+    };
+
+    // Use owner-only query as the primary subscription trigger, then merge
+    const qEvents = query(getEventsCollection(), where("ownerId", "==", owner.ownerId));
     const unsubscribeEvents = onSnapshot(
       qEvents,
-      (eventsSnapshot) => {
-        const newEventIds = eventsSnapshot.docs.map((doc) => doc.id);
-        
-        // Only re-setup listeners if the list of event IDs actually changed
-        const hasChanged = 
-          newEventIds.length !== userEventIds.length ||
-          newEventIds.some((id, idx) => id !== userEventIds[idx]);
+      async () => {
+        try {
+          const newEventIds = await buildMergedEventIds();
 
-        if (hasChanged) {
-          userEventIds = newEventIds;
-          setupEntriesListeners(userEventIds);
+          // Only re-setup listeners if the list of event IDs actually changed
+          const prevSet = new Set(userEventIds);
+          const nextSet = new Set(newEventIds);
+          const hasChanged =
+            newEventIds.length !== userEventIds.length ||
+            newEventIds.some((id) => !prevSet.has(id)) ||
+            userEventIds.some((id) => !nextSet.has(id));
+
+          if (hasChanged) {
+            userEventIds = newEventIds;
+            setupEntriesListeners(userEventIds);
+          }
+        } catch (err) {
+          console.error("Failed to resolve merged event IDs:", err);
         }
       },
       (error) => {
@@ -402,6 +464,9 @@ const getSortedEntries = async (eventId = null) => {
               .filter(
                 (e) =>
                   e.ownerId === owner.ownerId ||
+                  (Array.isArray(e.sharedUsers) &&
+                    (e.sharedUsers.includes(owner.ownerId) ||
+                      e.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
                   (Array.isArray(e.sharedEmails) &&
                     e.sharedEmails.includes(owner.ownerEmail.toLowerCase())),
               )
@@ -425,15 +490,14 @@ const getSortedEntries = async (eventId = null) => {
     if (!owner) return [];
 
     try {
-      const qEvents = query(
-        getEventsCollection(),
-        or(
-          where("ownerId", "==", owner.ownerId),
-          where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()),
-        ),
-      );
-      const snapshotEvents = await getDocs(qEvents);
-      const userEventIds = snapshotEvents.docs.map((doc) => doc.id);
+      const [s1, s2, s3] = await Promise.all([
+        getDocs(query(getEventsCollection(), where("ownerId", "==", owner.ownerId))),
+        getDocs(query(getEventsCollection(), where("sharedUsers", "array-contains", owner.ownerId))),
+        getDocs(query(getEventsCollection(), where("sharedEmails", "array-contains", owner.ownerEmail.toLowerCase()))),
+      ]);
+      const seenIds = new Set();
+      [...s1.docs, ...s2.docs, ...s3.docs].forEach((d) => seenIds.add(d.id));
+      const userEventIds = Array.from(seenIds);
 
       if (userEventIds.length === 0) return [];
 
@@ -467,6 +531,135 @@ export const StorageService = {
 
   subscribeToEntries: (eventId = null, callback, onError) =>
     subscribeToSortedEntries(eventId, callback, onError),
+
+  /**
+   * Subscribe to a single event by its Firestore document ID.
+   * Calls onError(new Error("Access Denied")) if the current user lacks
+   * access, or onError(new Error("Event not found")) if the doc is missing.
+   */
+  subscribeToEventById: (eventId, callback, onError) => {
+    const owner = getCurrentOwner();
+    if (!owner) {
+      if (onError) onError(new Error("Access Denied"));
+      return () => {};
+    }
+
+    if (!isFirebaseConfigured) {
+      const event = readLocalDB().events.find((e) => e.id === eventId);
+      if (!event) { if (onError) onError(new Error("Event not found")); return () => {}; }
+      const hasAccess =
+        event.ownerId === owner.ownerId ||
+        (Array.isArray(event.sharedUsers) &&
+          (event.sharedUsers.includes(owner.ownerId) ||
+            event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
+        (Array.isArray(event.sharedEmails) &&
+          event.sharedEmails.includes(owner.ownerEmail.toLowerCase()));
+      if (!hasAccess) { if (onError) onError(new Error("Access Denied")); return () => {}; }
+      callback(event);
+      return () => {};
+    }
+
+    const ref = doc(db, "events", eventId);
+    return onSnapshot(
+      ref,
+      (snap) => {
+        if (!snap.exists()) {
+          if (onError) onError(new Error("Event not found"));
+          return;
+        }
+        const event = normalizeEvent(snap);
+        const hasAccess =
+          event.ownerId === owner.ownerId ||
+          (Array.isArray(event.sharedUsers) &&
+            (event.sharedUsers.includes(owner.ownerId) ||
+              event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
+          (Array.isArray(event.sharedEmails) &&
+            event.sharedEmails.includes(owner.ownerEmail.toLowerCase()));
+        if (!hasAccess) {
+          if (onError) onError(new Error("Access Denied"));
+          return;
+        }
+        callback(event);
+      },
+      (error) => {
+        console.error("subscribeToEventById error:", error);
+        if (onError) onError(error);
+      },
+    );
+  },
+
+  /**
+   * Subscribe to a single event by its shareId URL token.
+   * Calls onError(new Error("Access Denied")) if the current user lacks
+   * access, or onError(new Error("Event not found")) if the doc is missing.
+   */
+  subscribeToEventByShareId: (shareId, callback, onError) => {
+    const owner = getCurrentOwner();
+    if (!owner) {
+      if (onError) onError(new Error("Access Denied"));
+      return () => {};
+    }
+
+    if (!isFirebaseConfigured) {
+      const event = readLocalDB().events.find((e) => e.shareId === shareId);
+      if (!event) { if (onError) onError(new Error("Event not found")); return () => {}; }
+      // For shared links we allow access as long as the user has been granted access
+      const hasAccess =
+        event.ownerId === owner.ownerId ||
+        (Array.isArray(event.sharedUsers) &&
+          (event.sharedUsers.includes(owner.ownerId) ||
+            event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
+        (Array.isArray(event.sharedEmails) &&
+          event.sharedEmails.includes(owner.ownerEmail.toLowerCase()));
+      if (!hasAccess) { if (onError) onError(new Error("Access Denied")); return () => {}; }
+      callback(event);
+      return () => {};
+    }
+
+    // First resolve the document ID, then subscribe to real-time updates
+    let unsubscribe = () => {};
+    getDocs(query(getEventsCollection(), where("shareId", "==", shareId)))
+      .then((snap) => {
+        if (snap.empty) {
+          if (onError) onError(new Error("Event not found"));
+          return;
+        }
+        const docId = snap.docs[0].id;
+        const ref = doc(db, "events", docId);
+        unsubscribe = onSnapshot(
+          ref,
+          (docSnap) => {
+            if (!docSnap.exists()) {
+              if (onError) onError(new Error("Event not found"));
+              return;
+            }
+            const event = normalizeEvent(docSnap);
+            const hasAccess =
+              event.ownerId === owner.ownerId ||
+              (Array.isArray(event.sharedUsers) &&
+                (event.sharedUsers.includes(owner.ownerId) ||
+                  event.sharedUsers.includes(owner.ownerEmail.toLowerCase()))) ||
+              (Array.isArray(event.sharedEmails) &&
+                event.sharedEmails.includes(owner.ownerEmail.toLowerCase()));
+            if (!hasAccess) {
+              if (onError) onError(new Error("Access Denied"));
+              return;
+            }
+            callback(event);
+          },
+          (error) => {
+            console.error("subscribeToEventByShareId snapshot error:", error);
+            if (onError) onError(error);
+          },
+        );
+      })
+      .catch((error) => {
+        console.error("subscribeToEventByShareId lookup error:", error);
+        if (onError) onError(error);
+      });
+
+    return () => unsubscribe();
+  },
 
   getSettings: async () => {
     if (!isFirebaseConfigured) {
@@ -734,6 +927,19 @@ export const StorageService = {
       return current.events[eventIndex];
     }
 
+    // Look up the helper's UID from the Firestore users collection
+    let helperUid = null;
+    try {
+      const usersSnap = await getDocs(
+        query(collection(db, "users"), where("email", "==", cleanEmail)),
+      );
+      if (!usersSnap.empty) {
+        helperUid = usersSnap.docs[0].data().uid || null;
+      }
+    } catch (err) {
+      console.warn("Could not look up helper UID from users collection:", err);
+    }
+
     const ref = doc(db, "events", eventId);
     const snap = await getDoc(ref);
     if (!snap.exists()) {
@@ -741,12 +947,24 @@ export const StorageService = {
     }
     const data = snap.data();
     const sharedEmails = Array.isArray(data.sharedEmails) ? data.sharedEmails : [];
+    const sharedUsers = Array.isArray(data.sharedUsers) ? data.sharedUsers : [];
+
     if (sharedEmails.includes(cleanEmail)) {
       throw new Error("This email is already added.");
     }
-    const updated = [...sharedEmails, cleanEmail];
-    await setDoc(ref, { sharedEmails: updated, updatedAt: new Date().toISOString() }, { merge: true });
-    return { id: eventId, ...data, sharedEmails: updated };
+
+    const updatedEmails = [...sharedEmails, cleanEmail];
+    // sharedUsers stores both UID (if found) and email for maximum compatibility
+    const updatedUsers = [...sharedUsers];
+    if (helperUid && !updatedUsers.includes(helperUid)) updatedUsers.push(helperUid);
+    if (!updatedUsers.includes(cleanEmail)) updatedUsers.push(cleanEmail);
+
+    await setDoc(
+      ref,
+      { sharedEmails: updatedEmails, sharedUsers: updatedUsers, updatedAt: new Date().toISOString() },
+      { merge: true },
+    );
+    return { id: eventId, ...data, sharedEmails: updatedEmails, sharedUsers: updatedUsers };
   },
 
   unshareEventWithEmail: async (eventId, email) => {
@@ -758,13 +976,28 @@ export const StorageService = {
       if (eventIndex === -1) throw new Error("Event not found");
       const event = current.events[eventIndex];
       const sharedEmails = Array.isArray(event.sharedEmails) ? event.sharedEmails : [];
+      const sharedUsers = Array.isArray(event.sharedUsers) ? event.sharedUsers : [];
       current.events[eventIndex] = {
         ...event,
         sharedEmails: sharedEmails.filter((e) => e !== cleanEmail),
+        sharedUsers: sharedUsers.filter((e) => e !== cleanEmail),
         updatedAt: new Date().toISOString(),
       };
       writeLocalDB(current);
       return current.events[eventIndex];
+    }
+
+    // Look up the helper's UID so we can remove it from sharedUsers too
+    let helperUid = null;
+    try {
+      const usersSnap = await getDocs(
+        query(collection(db, "users"), where("email", "==", cleanEmail)),
+      );
+      if (!usersSnap.empty) {
+        helperUid = usersSnap.docs[0].data().uid || null;
+      }
+    } catch (err) {
+      console.warn("Could not look up helper UID for unshare:", err);
     }
 
     const ref = doc(db, "events", eventId);
@@ -774,9 +1007,19 @@ export const StorageService = {
     }
     const data = snap.data();
     const sharedEmails = Array.isArray(data.sharedEmails) ? data.sharedEmails : [];
-    const updated = sharedEmails.filter((e) => e !== cleanEmail);
-    await setDoc(ref, { sharedEmails: updated, updatedAt: new Date().toISOString() }, { merge: true });
-    return { id: eventId, ...data, sharedEmails: updated };
+    const sharedUsers = Array.isArray(data.sharedUsers) ? data.sharedUsers : [];
+
+    const updatedEmails = sharedEmails.filter((e) => e !== cleanEmail);
+    const updatedUsers = sharedUsers.filter(
+      (e) => e !== cleanEmail && (helperUid ? e !== helperUid : true),
+    );
+
+    await setDoc(
+      ref,
+      { sharedEmails: updatedEmails, sharedUsers: updatedUsers, updatedAt: new Date().toISOString() },
+      { merge: true },
+    );
+    return { id: eventId, ...data, sharedEmails: updatedEmails, sharedUsers: updatedUsers };
   },
 
   deleteEvent: async (id) => {

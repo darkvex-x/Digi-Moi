@@ -123,43 +123,68 @@ export default function EventView() {
     setIsLoading(true);
     setLoadError("");
 
-    const unsubscribeEvents = StorageService.subscribeToEvents(
-      (events) => {
-        let nextEvent = null;
+    let unsubscribe = () => {};
 
-        if (shareId) {
-          nextEvent = events.find((event) => event.shareId === shareId) || null;
-        } else if (location.state?.eventId) {
-          nextEvent =
-            events.find((event) => event.id === location.state.eventId) || null;
-        } else if (events.length > 0) {
-          nextEvent = events[0];
-        }
-
-        if (!nextEvent) {
+    if (shareId) {
+      // Helper opened a shared event link — subscribe directly to that event
+      unsubscribe = StorageService.subscribeToEventByShareId(
+        shareId,
+        (event) => {
+          setActiveEvent(event);
+          setLoadError("");
+        },
+        (error) => {
+          console.error("Failed to subscribe to shared event:", error);
           setActiveEvent(null);
           setEntries([]);
           setIsLoading(false);
+          setLoadError(error?.message || "Event not found");
+        },
+      );
+    } else if (location.state?.eventId) {
+      // Admin/helper navigated with a specific event ID
+      unsubscribe = StorageService.subscribeToEventById(
+        location.state.eventId,
+        (event) => {
+          setActiveEvent(event);
           setLoadError("");
-          return;
-        }
-
-        setActiveEvent(nextEvent);
-        setLoadError("");
-      },
-      (error) => {
-        console.error("Failed to load event data from Firestore:", error);
-        setActiveEvent(null);
-        setEntries([]);
-        setIsLoading(false);
-        setLoadError(
-          "Unable to load event data from Firestore. Please refresh the page and try again.",
-        );
-      },
-    );
+        },
+        (error) => {
+          console.error("Failed to subscribe to event by ID:", error);
+          setActiveEvent(null);
+          setEntries([]);
+          setIsLoading(false);
+          setLoadError(error?.message || "Event not found");
+        },
+      );
+    } else {
+      // General dashboard navigation — load the first accessible event
+      unsubscribe = StorageService.subscribeToEvents(
+        (events) => {
+          if (events.length > 0) {
+            setActiveEvent(events[0]);
+            setLoadError("");
+          } else {
+            setActiveEvent(null);
+            setEntries([]);
+            setIsLoading(false);
+            setLoadError("");
+          }
+        },
+        (error) => {
+          console.error("Failed to load event data from Firestore:", error);
+          setActiveEvent(null);
+          setEntries([]);
+          setIsLoading(false);
+          setLoadError(
+            "Unable to load event data. Please refresh the page.",
+          );
+        },
+      );
+    }
 
     return () => {
-      unsubscribeEvents();
+      unsubscribe();
     };
   }, [location.state?.eventId, shareId]);
 
@@ -549,6 +574,34 @@ export default function EventView() {
       </div>
     </TableHead>
   );
+
+  if (loadError === "Access Denied") {
+    return (
+      <div className="flex h-full items-center justify-center min-h-[400px]">
+        <EmptyState
+          icon={CalendarDays}
+          title="Access Denied"
+          description="You do not have permission to view this event. Contact the administrator if you believe this is an error."
+          actionLabel="Go Home"
+          onAction={() => navigate(ROUTES.DASHBOARD)}
+        />
+      </div>
+    );
+  }
+
+  if (loadError === "Event not found") {
+    return (
+      <div className="flex h-full items-center justify-center min-h-[400px]">
+        <EmptyState
+          icon={CalendarDays}
+          title="Event Not Found"
+          description="The shared event could not be found. The link may be invalid or the event may have been removed."
+          actionLabel="Go Home"
+          onAction={() => navigate(ROUTES.DASHBOARD)}
+        />
+      </div>
+    );
+  }
 
   if (loadError) {
     return (
