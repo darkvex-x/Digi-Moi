@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Plus,
   Edit2,
+  Trash2,
   UserX,
   UserCheck,
   UsersRound,
@@ -61,8 +62,16 @@ export default function UserManagement() {
   // Disable / Enable Confirm
   const [toggleUser, setToggleUser] = useState(null);
 
+  // Delete Confirm
+  const [userToDelete, setUserToDelete] = useState(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+
   // Access guard — redirect non-admins
   const canManage = permissions.includes(PERMISSIONS.MANAGE_USERS);
+
+  // The currently logged-in admin's identifiers
+  const currentUserEmail = StorageService.getCurrentUserEmail();
+  const currentUserId = StorageService.getCurrentUserId();
 
   useEffect(() => {
     if (!canManage) {
@@ -104,6 +113,12 @@ export default function UserManagement() {
         (u.role || "").toLowerCase().includes(q),
     );
   }, [users, searchQuery]);
+
+  // Count of admins — used to protect the last admin
+  const adminCount = useMemo(
+    () => users.filter((u) => u.role === "admin").length,
+    [users],
+  );
 
   // ── Form Handlers ──
 
@@ -210,6 +225,55 @@ export default function UserManagement() {
     }
   };
 
+  // ── Permanent Delete ──
+
+  /**
+   * Returns a block reason string if deletion is not allowed, or null if OK.
+   */
+  const getDeleteBlockReason = (user) => {
+    if (
+      user.uid === currentUserId ||
+      (user.email || "").toLowerCase() === currentUserEmail
+    ) {
+      return "You cannot delete your own account.";
+    }
+    if (user.role === "admin" && adminCount <= 1) {
+      return "Cannot delete the only remaining admin account.";
+    }
+    return null;
+  };
+
+  const handleDeleteClick = (user) => {
+    const blockReason = getDeleteBlockReason(user);
+    if (blockReason) {
+      addToast({ type: "error", title: "Action Blocked", message: blockReason });
+      return;
+    }
+    setUserToDelete(user);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!userToDelete) return;
+    setIsDeleting(true);
+    try {
+      await StorageService.deleteUser(userToDelete.id);
+      addToast({
+        type: "success",
+        title: "User Deleted",
+        message: `${userToDelete.name || userToDelete.email} has been permanently deleted and their event access has been revoked.`,
+      });
+      setUserToDelete(null);
+    } catch (error) {
+      addToast({
+        type: "error",
+        title: "Delete Failed",
+        message: error.message || "Could not delete the user.",
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   if (!canManage) return null;
 
   return (
@@ -300,99 +364,139 @@ export default function UserManagement() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredUsers.map((user) => (
-                  <TableRow
-                    key={user.id}
-                    className="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors"
-                  >
-                    <TableCell className="font-medium">
-                      <div className="flex items-center gap-3">
-                        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center text-indigo-600 dark:text-indigo-400 text-sm font-bold">
-                          {(user.name || user.email || "?")
-                            .charAt(0)
-                            .toUpperCase()}
+                {filteredUsers.map((user) => {
+                  const isSelf =
+                    user.uid === currentUserId ||
+                    (user.email || "").toLowerCase() === currentUserEmail;
+                  const isLastAdmin = user.role === "admin" && adminCount <= 1;
+                  const deleteBlocked = isSelf || isLastAdmin;
+
+                  return (
+                    <TableRow
+                      key={user.id}
+                      className="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors"
+                    >
+                      <TableCell className="font-medium">
+                        <div className="flex items-center gap-3">
+                          <div className="flex-shrink-0 w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center text-indigo-600 dark:text-indigo-400 text-sm font-bold">
+                            {(user.name || user.email || "?")
+                              .charAt(0)
+                              .toUpperCase()}
+                          </div>
+                          <div>
+                            <p className="font-medium text-gray-900 dark:text-white">
+                              {user.name || "—"}
+                              {isSelf && (
+                                <span className="ml-2 text-xs text-indigo-500 font-normal">
+                                  (you)
+                                </span>
+                              )}
+                            </p>
+                            <p className="md:hidden text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                              {user.email || "—"}
+                            </p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="font-medium text-gray-900 dark:text-white">
-                            {user.name || "—"}
-                          </p>
-                          <p className="md:hidden text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                            {user.email || "—"}
-                          </p>
-                        </div>
-                      </div>
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-gray-500 dark:text-gray-400">
-                      {user.email || "—"}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant={
-                          user.role === "admin" ? "primary" : "default"
-                        }
-                        className="gap-1"
-                      >
-                        {user.role === "admin" ? (
-                          <ShieldCheck size={12} />
-                        ) : (
-                          <Shield size={12} />
-                        )}
-                        {ROLE_LABELS[user.role] || user.role || "Helper"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant={
-                          user.active === false ? "danger" : "success"
-                        }
-                      >
-                        {user.active === false ? "Disabled" : "Active"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="hidden lg:table-cell text-gray-500 dark:text-gray-400 text-sm">
-                      {user.createdAt
-                        ? new Date(user.createdAt).toLocaleDateString("en-IN", {
-                            day: "numeric",
-                            month: "short",
-                            year: "numeric",
-                          })
-                        : "—"}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => openEditModal(user)}
-                          title="Edit user"
-                        >
-                          <Edit2 size={15} />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setToggleUser(user)}
-                          title={
-                            user.active === false
-                              ? "Enable user"
-                              : "Disable user"
+                      </TableCell>
+                      <TableCell className="hidden md:table-cell text-gray-500 dark:text-gray-400">
+                        {user.email || "—"}
+                      </TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={
+                            user.role === "admin" ? "primary" : "default"
                           }
-                          className={
-                            user.active === false
-                              ? "text-emerald-600 hover:text-emerald-700"
-                              : "text-red-500 hover:text-red-600"
-                          }
+                          className="gap-1"
                         >
-                          {user.active === false ? (
-                            <UserCheck size={15} />
+                          {user.role === "admin" ? (
+                            <ShieldCheck size={12} />
                           ) : (
-                            <UserX size={15} />
+                            <Shield size={12} />
                           )}
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                          {ROLE_LABELS[user.role] || user.role || "Helper"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <Badge
+                          variant={
+                            user.active === false ? "danger" : "success"
+                          }
+                        >
+                          {user.active === false ? "Disabled" : "Active"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="hidden lg:table-cell text-gray-500 dark:text-gray-400 text-sm">
+                        {user.createdAt
+                          ? new Date(user.createdAt).toLocaleDateString(
+                              "en-IN",
+                              {
+                                day: "numeric",
+                                month: "short",
+                                year: "numeric",
+                              },
+                            )
+                          : "—"}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          {/* Edit */}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => openEditModal(user)}
+                            title="Edit user"
+                          >
+                            <Edit2 size={15} />
+                          </Button>
+
+                          {/* Disable / Enable */}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setToggleUser(user)}
+                            title={
+                              user.active === false
+                                ? "Enable user"
+                                : "Disable user"
+                            }
+                            className={
+                              user.active === false
+                                ? "text-emerald-600 hover:text-emerald-700"
+                                : "text-amber-500 hover:text-amber-600"
+                            }
+                          >
+                            {user.active === false ? (
+                              <UserCheck size={15} />
+                            ) : (
+                              <UserX size={15} />
+                            )}
+                          </Button>
+
+                          {/* Permanent Delete */}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => handleDeleteClick(user)}
+                            title={
+                              isSelf
+                                ? "Cannot delete your own account"
+                                : isLastAdmin
+                                  ? "Cannot delete the only admin"
+                                  : "Permanently delete user"
+                            }
+                            className={
+                              deleteBlocked
+                                ? "text-gray-300 dark:text-gray-600 cursor-not-allowed"
+                                : "text-red-500 hover:text-red-600"
+                            }
+                          >
+                            <Trash2 size={15} />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
@@ -502,6 +606,18 @@ export default function UserManagement() {
         }
         confirmText={toggleUser?.active === false ? "Enable" : "Disable"}
         isDanger={toggleUser?.active !== false}
+      />
+
+      {/* Permanent Delete Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={!!userToDelete}
+        onClose={() => !isDeleting && setUserToDelete(null)}
+        onConfirm={handleConfirmDelete}
+        title="Delete User Permanently?"
+        message={`Are you sure you want to permanently delete ${userToDelete?.name || userToDelete?.email}? This will immediately revoke their access to all shared events. This action cannot be undone.`}
+        confirmText="Delete Forever"
+        isDanger
+        isLoading={isDeleting}
       />
     </div>
   );

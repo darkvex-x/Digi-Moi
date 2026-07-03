@@ -4,6 +4,7 @@ import {
   getDoc,
   getDocs,
   onSnapshot,
+  orderBy,
   query,
   runTransaction,
   setDoc,
@@ -1662,22 +1663,100 @@ export const StorageService = {
   },
 
   /**
-   * Deletes a user document from the "users" collection.
+   * Permanently deletes a user document from the "users" collection and
+   * removes the user from every event's sharedUsers / sharedEmails arrays.
    */
   deleteUser: async (id) => {
     if (!isFirebaseConfigured) {
       throw new Error("Firebase is not configured.");
     }
 
-    const { deleteDoc } = await import("firebase/firestore");
     const ref = doc(db, "users", id);
     const snapshot = await getDoc(ref);
     if (!snapshot.exists()) {
       throw new Error("User not found.");
     }
 
-    await deleteDoc(ref);
+    const userData = snapshot.data();
+    const userEmail = (userData.email || "").toLowerCase();
+    const userUid = userData.uid || null;
+
+    // Find every event that references this user and strip them out
+    const eventsToUpdate = [];
+    try {
+      // Query events where this helper appears in sharedEmails
+      const [snapByEmail, snapByUid] = await Promise.all([
+        userEmail
+          ? getDocs(query(getEventsCollection(), where("sharedEmails", "array-contains", userEmail)))
+          : Promise.resolve({ docs: [] }),
+        userUid
+          ? getDocs(query(getEventsCollection(), where("sharedUsers", "array-contains", userUid)))
+          : Promise.resolve({ docs: [] }),
+      ]);
+
+      const seen = new Set();
+      [...snapByEmail.docs, ...snapByUid.docs].forEach((d) => {
+        if (!seen.has(d.id)) {
+          seen.add(d.id);
+          eventsToUpdate.push(d);
+        }
+      });
+    } catch (err) {
+      console.warn("Could not query events for user cleanup:", err);
+    }
+
+    // Use a batch to atomically delete the user doc + update all affected events
+    // Firestore batches support max 500 operations; split into chunks if needed
+    const BATCH_LIMIT = 490;
+    const allOps = [];
+
+    // Delete user doc
+    allOps.push({ type: "delete", ref });
+
+    // Strip user from each event's sharedUsers and sharedEmails
+    eventsToUpdate.forEach((eventDoc) => {
+      const data = eventDoc.data();
+      const updatedEmails = Array.isArray(data.sharedEmails)
+        ? data.sharedEmails.filter((e) => e !== userEmail)
+        : [];
+      const updatedUsers = Array.isArray(data.sharedUsers)
+        ? data.sharedUsers.filter(
+            (e) => e !== userEmail && (userUid ? e !== userUid : true),
+          )
+        : [];
+      allOps.push({
+        type: "set",
+        ref: eventDoc.ref,
+        data: { ...data, sharedEmails: updatedEmails, sharedUsers: updatedUsers, updatedAt: new Date().toISOString() },
+      });
+    });
+
+    // Execute in batches of BATCH_LIMIT
+    for (let i = 0; i < allOps.length; i += BATCH_LIMIT) {
+      const chunk = allOps.slice(i, i + BATCH_LIMIT);
+      const batch = writeBatch(db);
+      chunk.forEach((op) => {
+        if (op.type === "delete") batch.delete(op.ref);
+        else batch.set(op.ref, op.data, { merge: true });
+      });
+      await batch.commit();
+    }
+
     return true;
+  },
+
+  /**
+   * Returns the email of the currently authenticated user, or null.
+   */
+  getCurrentUserEmail: () => {
+    return auth.currentUser?.email?.toLowerCase() || null;
+  },
+
+  /**
+   * Returns the UID of the currently authenticated user, or null.
+   */
+  getCurrentUserId: () => {
+    return auth.currentUser?.uid || null;
   },
 };
 
