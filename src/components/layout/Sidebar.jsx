@@ -24,8 +24,22 @@ export default function Sidebar() {
           />
         </div>
         <div className="hidden lg:flex flex-col leading-none">
-          <span className="font-display font-bold text-[15px] text-[var(--text-primary)] tracking-tight">Digi Moi</span>
-          <span className="font-heading text-[10px] text-[var(--muted)] font-medium tracking-wide mt-0.5">Wedding Collection</span>
+          <span
+            style={{
+              fontFamily: "'Shojumaru', serif",
+              fontSize: "20px",
+              fontWeight: 900,
+              letterSpacing: "2px",
+              color: "#ff0000",
+              textShadow: "0 4px 12px rgba(0,0,0,.25)",
+            }}
+            className="font-display font-bold text-[15px] text-[var(--text-primary)] tracking-tight"
+          >
+            Digi Moi
+          </span>
+          <span className="font-heading text-[10px] text-[var(--muted)] font-medium tracking-wide mt-0.5">
+            Wedding Collection
+          </span>
         </div>
       </div>
 
@@ -50,7 +64,9 @@ export default function Sidebar() {
                 size={18}
                 className="flex-shrink-0 transition-transform duration-150 group-hover:scale-105"
               />
-              <span className="hidden lg:block font-heading whitespace-nowrap">{item.name}</span>
+              <span className="hidden lg:block font-heading whitespace-nowrap">
+                {item.name}
+              </span>
             </NavLink>
           );
         })}
